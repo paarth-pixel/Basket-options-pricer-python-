@@ -22,22 +22,43 @@ TICKER_UNIVERSE = ["TSLA", "SPCX", "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "MET
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_data(tickers: tuple):
-    """Spots, realized vols (30d and 1y), and 1y realized correlation."""
+    """
+    Spots, realized vols (30d and long-run) and realized correlation.
+    Uses whatever history each ticker has — recent IPOs (e.g. SPCX) just get
+    shorter windows. Vols are computed per ticker on its own available data;
+    correlation on the overlapping window. Falls back gracefully if a window
+    is too short.
+    """
     import yfinance as yf
 
     px = yf.download(list(tickers), period="1y", auto_adjust=True, progress=False)["Close"]
     if isinstance(px, pd.Series):
         px = px.to_frame(tickers[0])
-    px = px[list(tickers)].dropna()
-    if len(px) < 40:
-        raise ValueError("Not enough price history returned.")
+    px = px[list(tickers)]
 
-    rets = np.log(px / px.shift(1)).dropna()
-    spots = px.iloc[-1].to_dict()
-    vol_1y = (rets.std() * np.sqrt(252)).to_dict()
-    vol_30d = (rets.tail(30).std() * np.sqrt(252)).to_dict()
-    corr = float(rets.corr().iloc[0, 1]) if len(tickers) == 2 else 1.0
-    return spots, vol_30d, vol_1y, corr, px
+    spots, vol_30d, vol_lr, days_used = {}, {}, {}, {}
+    for tkr in tickers:
+        s = px[tkr].dropna()
+        if len(s) < 2:
+            raise ValueError(f"No usable price history for {tkr}.")
+        rets = np.log(s / s.shift(1)).dropna()
+        spots[tkr] = float(s.iloc[-1])
+        days_used[tkr] = len(rets)
+        # Long-run vol: full available history (up to 1y)
+        vol_lr[tkr] = float(rets.std(ddof=1) * np.sqrt(252)) if len(rets) >= 10 else 0.60
+        # Short-run vol: last 30 obs, or whatever exists (min 10 for stability)
+        tail = rets.tail(min(30, len(rets)))
+        vol_30d[tkr] = float(tail.std(ddof=1) * np.sqrt(252)) if len(tail) >= 10 else vol_lr[tkr]
+
+    # Correlation on the overlap of the two series
+    both = np.log(px / px.shift(1)).dropna()
+    overlap = len(both)
+    if overlap >= 20:
+        corr = float(both.corr().iloc[0, 1])
+    else:
+        corr = 0.50  # not enough overlap to estimate — sensible default, adjust the slider
+    meta = {"days_used": days_used, "overlap_days": overlap, "corr_estimated": overlap >= 20}
+    return spots, vol_30d, vol_lr, corr, px, meta
 
 
 # ----------------------------------------------------------------------------
@@ -131,11 +152,20 @@ if t1 == t2:
 use_live = st.sidebar.toggle("Use live market data", value=True)
 
 md_ok, px_hist = False, None
+md_meta = None
 if use_live:
     try:
         with st.spinner(f"Fetching {t1} / {t2} data..."):
-            spots_d, vol30_d, vol1y_d, corr_mkt, px_hist = fetch_market_data((t1, t2))
+            spots_d, vol30_d, vol1y_d, corr_mkt, px_hist, md_meta = fetch_market_data((t1, t2))
         md_ok = True
+        d1, d2 = md_meta["days_used"][t1], md_meta["days_used"][t2]
+        st.sidebar.caption(f"History used: {t1} {d1}d · {t2} {d2}d · overlap {md_meta['overlap_days']}d")
+        if not md_meta["corr_estimated"]:
+            st.sidebar.warning("Too little overlapping history to estimate correlation — "
+                               "defaulting to 0.50. Set it yourself with the slider.")
+        elif min(d1, d2) < 60:
+            st.sidebar.info("One ticker has a short history (recent IPO) — vol and "
+                            "correlation estimates are noisy. Sanity-check the sliders.")
     except Exception as e:
         st.sidebar.warning(f"Market data fetch failed ({e}). Enter values manually.")
 
@@ -204,7 +234,7 @@ mc4.metric("Strike levels", f"${S1 * K_pct:,.2f} / ${S2 * K_pct:,.2f}")
 
 if px_hist is not None:
     with st.expander("Underlying price history (1y)"):
-        norm_px = px_hist / px_hist.iloc[0] * 100
+        norm_px = px_hist.apply(lambda s: s / s.loc[s.first_valid_index()] * 100)
         figp = go.Figure()
         for col in norm_px.columns:
             figp.add_trace(go.Scatter(x=norm_px.index, y=norm_px[col], name=col, mode="lines"))
