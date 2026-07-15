@@ -73,36 +73,92 @@ def fetch_riskfree_seed() -> float:
     return 0.04
 
 
-def _smile_from_chain(chain, spot):
-    """One expiry's smile: OTM options only, junk filtered. -> (moneyness, iv) sorted."""
-    puts, calls = chain.puts, chain.calls
-    rows = []
-    for df, side in ((puts, "put"), (calls, "call")):
+def _norm_cdf(x):
+    from math import erf
+    return 0.5 * (1.0 + np.vectorize(erf)(np.asarray(x, dtype=float) / np.sqrt(2.0)))
+
+
+def _bs_price_vec(S, K, T, r, q, sig, is_put):
+    """Vectorized Black–Scholes price."""
+    sig = np.maximum(np.asarray(sig, dtype=float), 1e-9)
+    K = np.asarray(K, dtype=float)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sig**2) * T) / (sig * np.sqrt(T))
+    d2 = d1 - sig * np.sqrt(T)
+    if is_put:
+        return K * np.exp(-r * T) * _norm_cdf(-d2) - S * np.exp(-q * T) * _norm_cdf(-d1)
+    return S * np.exp(-q * T) * _norm_cdf(d1) - K * np.exp(-r * T) * _norm_cdf(d2)
+
+
+def _implied_vol_vec(mids, S, Ks, T, r, q, is_put):
+    """
+    Invert BS for vol from MID prices by vectorized bisection.
+    We compute IV ourselves because Yahoo's impliedVolatility column is derived
+    from stale last-trade prices and badly lowballs thinly traded LEAPS.
+    """
+    mids = np.asarray(mids, dtype=float)
+    Ks = np.asarray(Ks, dtype=float)
+    lo = np.full_like(mids, 0.005)
+    hi = np.full_like(mids, 4.0)
+    # no-arbitrage bounds: drop quotes outside them (unsolvable)
+    if is_put:
+        lower = np.maximum(Ks * np.exp(-r * T) - S * np.exp(-q * T), 0.0)
+        upper = Ks * np.exp(-r * T)
+    else:
+        lower = np.maximum(S * np.exp(-q * T) - Ks * np.exp(-r * T), 0.0)
+        upper = S * np.exp(-q * T)
+    ok = (mids > lower + 1e-6) & (mids < upper - 1e-6)
+    for _ in range(80):
+        mid_sig = 0.5 * (lo + hi)
+        px = _bs_price_vec(S, Ks, T, r, q, mid_sig, is_put)
+        too_low = px < mids
+        lo = np.where(too_low, mid_sig, lo)
+        hi = np.where(too_low, hi, mid_sig)
+    iv = 0.5 * (lo + hi)
+    return iv, ok & (iv > 0.02) & (iv < 3.5)
+
+
+def _smile_from_chain(chain, spot, T_exp, r, q):
+    """
+    One expiry's smile from LIVE BID/ASK MIDS with our own IV inversion.
+    OTM options only (puts below spot, calls above). Returns
+    (smile_df[m, iv], quotes_df for transparency) or (None, None).
+    """
+    frames, quotes = [], []
+    for df, is_put in ((chain.puts, True), (chain.calls, False)):
         if df is None or len(df) == 0:
             continue
         d = df.copy()
-        d = d[(d["bid"] > 0) & (d["ask"] > 0) & d["impliedVolatility"].between(0.01, 4.0)]
+        d = d[(d["bid"] > 0) & (d["ask"] >= d["bid"])]
+        d["mid"] = 0.5 * (d["bid"] + d["ask"])
+        d = d[d["mid"] >= 0.03]
         d["m"] = d["strike"] / spot
         d = d[(d["m"] > 0.35) & (d["m"] < 1.8)]
-        # OTM side only: puts below spot, calls above (cleaner IVs)
-        d = d[d["m"] <= 1.0] if side == "put" else d[d["m"] > 1.0]
-        rows.append(d[["m", "impliedVolatility"]])
-    if not rows:
-        return None
-    sm = pd.concat(rows).sort_values("m")
-    sm = sm.groupby("m", as_index=False)["impliedVolatility"].mean()
-    return sm if len(sm) >= 4 else None
+        d = d[d["m"] <= 1.0] if is_put else d[d["m"] > 1.0]
+        if len(d) == 0:
+            continue
+        iv, ok = _implied_vol_vec(d["mid"].to_numpy(), spot, d["strike"].to_numpy(),
+                                  T_exp, r, q, is_put)
+        d["iv_mid"] = iv
+        d = d[ok]
+        if len(d):
+            frames.append(d[["m", "iv_mid"]])
+            qq = d[["strike", "bid", "ask", "mid", "iv_mid"]].copy()
+            qq["type"] = "put" if is_put else "call"
+            quotes.append(qq)
+    if not frames:
+        return None, None
+    sm = pd.concat(frames).sort_values("m")
+    sm = sm.groupby("m", as_index=False)["iv_mid"].mean().rename(columns={"iv_mid": "iv"})
+    if len(sm) < 4:
+        return None, None
+    return sm, pd.concat(quotes).sort_values("strike")
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_iv(ticker: str, spot: float, target_T: float):
+def fetch_iv(ticker: str, spot: float, target_T: float, r: float, q: float):
     """
-    Implied vol at ATM and at any moneyness, interpolated to target_T.
-
-    Picks the two listed expiries bracketing the target maturity, builds an
-    OTM smile for each, then interpolates linearly in TOTAL VARIANCE across
-    time. Returns a dict with iv(m) callable data, diagnostics, and the
-    short-dated ATM vol (used to seed Heston v0).
+    Implied vol at any moneyness, interpolated to target_T in total variance.
+    Smiles are built from live bid/ask mids with our own BS inversion.
     """
     import yfinance as yf
     tk = yf.Ticker(ticker)
@@ -111,32 +167,41 @@ def fetch_iv(ticker: str, spot: float, target_T: float):
         raise ValueError(f"{ticker}: no listed options")
 
     today = dt.date.today()
-    Ts = np.array([max(( dt.date.fromisoformat(e) - today).days, 1) / 365.0 for e in expiries])
+    Ts = np.array([max((dt.date.fromisoformat(e) - today).days, 1) / 365.0 for e in expiries])
     order = np.argsort(Ts)
     Ts, expiries = Ts[order], [expiries[i] for i in order]
 
-    # bracketing expiries (clamp to ends if target is outside listed range)
     hi_idx = int(np.searchsorted(Ts, target_T))
     lo_idx = max(hi_idx - 1, 0)
     hi_idx = min(hi_idx, len(Ts) - 1)
     extrapolated = target_T > Ts[-1] + 1e-9 or target_T < Ts[0] - 1e-9
 
-    smiles, used = {}, []
-    for idx in {lo_idx, hi_idx}:
-        sm = _smile_from_chain(tk.option_chain(expiries[idx]), spot)
+    # widen outward if a bracketing chain is too thin to build a smile
+    candidates = list(dict.fromkeys(
+        [lo_idx, hi_idx, max(lo_idx - 1, 0), min(hi_idx + 1, len(Ts) - 1)]))
+    smiles, quotes_by_exp, used = {}, {}, []
+    for idx in candidates:
+        if idx in smiles:
+            continue
+        sm, qt = _smile_from_chain(tk.option_chain(expiries[idx]), spot, float(Ts[idx]), r, q)
         if sm is not None:
             smiles[idx] = sm
+            quotes_by_exp[expiries[idx]] = qt
             used.append((expiries[idx], float(Ts[idx]), len(sm)))
+        if len(smiles) >= 2 and any(k >= hi_idx for k in smiles) and any(k <= lo_idx for k in smiles):
+            break
     if not smiles:
-        raise ValueError(f"{ticker}: option chains too thin to build a smile")
+        raise ValueError(f"{ticker}: option chains too thin to build a smile from live quotes")
+
+    # keep the two smiles tightest around target_T (or the single closest)
+    ids = sorted(smiles, key=lambda k: abs(Ts[k] - target_T))[:2]
+    ids = sorted(ids)
 
     def iv_at(idx, m):
         sm = smiles[idx]
-        return float(np.interp(m, sm["m"].to_numpy(), sm["impliedVolatility"].to_numpy()))
+        return float(np.interp(m, sm["m"].to_numpy(), sm["iv"].to_numpy()))
 
     def iv(m):
-        """IV at moneyness m for target_T via total-variance interpolation."""
-        ids = sorted(smiles)
         if len(ids) == 1:
             return iv_at(ids[0], m)
         i0, i1 = ids
@@ -146,28 +211,26 @@ def fetch_iv(ticker: str, spot: float, target_T: float):
         T_eff = (1 - w) * T0 + w * T1
         return float(np.sqrt(max(tv, 1e-8) / max(T_eff, 1e-8)))
 
-    # short-dated ATM vol for Heston v0 seed: nearest expiry >= ~2 weeks with a smile
+    # short-dated ATM vol for Heston v0 seed
     v0_seed = None
-    for idx in range(len(Ts)):
+    for idx in sorted(smiles):
         if Ts[idx] >= 10 / 365:
-            sm = _smile_from_chain(tk.option_chain(expiries[idx]), spot)
-            if sm is not None:
-                v0_seed = float(np.interp(1.0, sm["m"].to_numpy(), sm["impliedVolatility"].to_numpy()))
-                break
-    # pack smile points of the longer bracketing expiry for plotting
-    plot_idx = max(smiles)
-    plot_sm = smiles[plot_idx]
+            v0_seed = iv_at(idx, 1.0)
+            break
+
+    plot_idx = ids[-1]
     return {
-        "iv_curve_m": plot_sm["m"].tolist(),
-        "iv_curve_v": plot_sm["impliedVolatility"].tolist(),
+        "iv_curve_m": smiles[plot_idx]["m"].tolist(),
+        "iv_curve_v": smiles[plot_idx]["iv"].tolist(),
         "plot_expiry": expiries[plot_idx],
         "iv_atm": iv(1.0),
-        "iv_fn_points": {int(k): (smiles[k]["m"].tolist(), smiles[k]["impliedVolatility"].tolist(),
-                                  float(Ts[k])) for k in smiles},
+        "iv_fn_points": {int(k): (smiles[k]["m"].tolist(), smiles[k]["iv"].tolist(),
+                                  float(Ts[k])) for k in ids},
         "target_T": target_T,
-        "used": used,
+        "used": [(e, t, n) for (e, t, n) in used],
         "extrapolated": bool(extrapolated),
         "v0_seed": v0_seed,
+        "quotes": {e: quotes_by_exp[e].to_dict("records") for e in quotes_by_exp},
     }
 
 
@@ -319,12 +382,12 @@ except Exception as e:
 q1, q2 = fetch_div_yield(t1), fetch_div_yield(t2)
 
 iv_packs, iv_strike, iv_source = {}, {}, {}
-for tkr, spot in ((t1, S1), (t2, S2)):
+for tkr, spot, qq in ((t1, S1, q1), (t2, S2, q2)):
     try:
-        pack = fetch_iv(tkr, spot, T)
+        pack = fetch_iv(tkr, spot, T, r, qq)
         iv_packs[tkr] = pack
         iv_strike[tkr] = iv_from_pack(pack, K_pct)
-        iv_source[tkr] = "implied"
+        iv_source[tkr] = "implied (from live bid/ask mids)"
     except Exception as e:
         iv_strike[tkr] = vollr_d[tkr]
         iv_source[tkr] = "realized (fallback)"
@@ -332,6 +395,13 @@ for tkr, spot in ((t1, S1), (t2, S2)):
 
 for msg in fetch_errors:
     st.warning(msg)
+
+# staleness / sanity check: implied should rarely sit far below realized
+for tkr in (t1, t2):
+    if iv_source[tkr].startswith("implied") and iv_strike[tkr] < 0.75 * vollr_d[tkr]:
+        st.warning(f"{tkr}: strike IV ({iv_strike[tkr]:.1%}) is well below realized vol "
+                   f"({vollr_d[tkr]:.1%}) — quotes may be stale or the chain thin at this "
+                   "tenor. Cross-check against your broker screen and override if needed.")
 
 # ---- data summary -----------------------------------------------------------
 mcols = st.columns(4)
@@ -363,8 +433,27 @@ with st.expander("Implied vol smiles (as fetched)"):
     figs.update_layout(xaxis_title="Moneyness (% of spot)", yaxis_title="Implied vol (%)",
                        height=380, legend=dict(orientation="h"))
     st.plotly_chart(figs, use_container_width=True)
-    st.caption("OTM options only, zero-bid strikes filtered out. The pricer reads the vol "
-               "exactly at the strike line, interpolated to your maturity in total variance.")
+    st.caption("Smiles built from **live bid/ask mid prices** with our own Black–Scholes "
+               "inversion (Yahoo's own IV field uses stale last-trade prices and lowballs "
+               "thin LEAPS — that's why it's not used). OTM options only, zero-bid strikes "
+               "dropped. The pricer reads the vol exactly at the strike line, interpolated "
+               "to your maturity in total variance.")
+
+with st.expander("Quotes used near the strike (verify against your broker screen)"):
+    for tkr, spot in ((t1, S1), (t2, S2)):
+        if tkr not in iv_packs:
+            continue
+        for exp_name, recs in iv_packs[tkr]["quotes"].items():
+            qdf = pd.DataFrame(recs)
+            qdf = qdf[qdf["type"] == "put"]
+            if qdf.empty:
+                continue
+            k_target = K_pct * spot
+            qdf = qdf.iloc[(qdf["strike"] - k_target).abs().argsort()[:6]].sort_values("strike")
+            qdf["IV (mid)"] = (qdf["iv_mid"] * 100).round(1).astype(str) + "%"
+            st.markdown(f"**{tkr} — {exp_name}** (target strike ≈ ${k_target:,.0f})")
+            st.dataframe(qdf[["strike", "bid", "ask", "mid", "IV (mid)"]],
+                         hide_index=True, use_container_width=True)
 
 # ---- pricing inputs (editable, seeded from the surface) ----------------------
 st.subheader("Pricing inputs")
