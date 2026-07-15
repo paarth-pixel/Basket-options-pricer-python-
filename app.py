@@ -1,8 +1,9 @@
 """
-Worst-of Put Pricer — Heston Monte Carlo
-Client sells a worst-of put on 2 stocks. Each stock has its OWN full Heston
-parameter set (v0, theta, kappa, xi, rho), entered via editable tables and
-seeded from live market data. Built for Streamlit Community Cloud.
+Worst-of Put Pricer — market-implied edition
+Client sells a worst-of put on 2 stocks. Headline price uses each stock's
+IMPLIED volatility read from its live option chain at the trade's strike and
+tenor (skew included), interpolated across expiries in total variance.
+A per-stock Heston engine is kept as a stochastic-vol comparison.
 """
 
 import datetime as dt
@@ -15,133 +16,258 @@ import streamlit as st
 st.set_page_config(page_title="Worst-of Put Pricer", page_icon="📉", layout="wide")
 
 TICKER_UNIVERSE = ["TSLA", "SPCX", "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "AMD", "NFLX"]
+PARAM_LABELS = ["Initial vol √v₀ (%)", "Long-run vol √θ (%)", "Mean reversion κ", "Vol of vol ξ", "Spot–vol corr ρ"]
 
-PARAM_LABELS = [
-    "Initial vol √v₀ (%)",
-    "Long-run vol √θ (%)",
-    "Mean reversion κ",
-    "Vol of vol ξ",
-    "Spot–vol corr ρ",
-]
-
-# ----------------------------------------------------------------------------
-# Market data
-# ----------------------------------------------------------------------------
+# ============================================================================
+# MARKET DATA
+# ============================================================================
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_market_data(tickers: tuple):
-    """
-    Spots, realized vols (30d and long-run) and realized correlation.
-    Uses whatever history each ticker has — recent IPOs (e.g. SPCX) just get
-    shorter windows. Vols per ticker on its own data; correlation on overlap.
-    """
+def fetch_hist(tickers: tuple):
+    """Spots, realized vols and realized correlation from price history."""
     import yfinance as yf
-
     px = yf.download(list(tickers), period="1y", auto_adjust=True, progress=False)["Close"]
     if isinstance(px, pd.Series):
         px = px.to_frame(tickers[0])
     px = px[list(tickers)]
-
-    spots, vol_30d, vol_lr, days_used = {}, {}, {}, {}
+    spots, vol_lr, days_used = {}, {}, {}
     for tkr in tickers:
         s = px[tkr].dropna()
         if len(s) < 2:
-            raise ValueError(f"No usable price history for {tkr}.")
+            raise ValueError(f"No price history for {tkr}.")
         rets = np.log(s / s.shift(1)).dropna()
         spots[tkr] = float(s.iloc[-1])
         days_used[tkr] = len(rets)
         vol_lr[tkr] = float(rets.std(ddof=1) * np.sqrt(252)) if len(rets) >= 10 else 0.60
-        tail = rets.tail(min(30, len(rets)))
-        vol_30d[tkr] = float(tail.std(ddof=1) * np.sqrt(252)) if len(tail) >= 10 else vol_lr[tkr]
-
     both = np.log(px / px.shift(1)).dropna()
-    overlap = len(both)
-    corr = float(both.corr().iloc[0, 1]) if overlap >= 20 else 0.50
-    meta = {"days_used": days_used, "overlap_days": overlap, "corr_estimated": overlap >= 20}
-    return spots, vol_30d, vol_lr, corr, px, meta
+    corr = float(both.corr().iloc[0, 1]) if len(both) >= 20 else 0.50
+    return spots, vol_lr, corr, px, {"days_used": days_used, "overlap": len(both),
+                                     "corr_est": len(both) >= 20}
 
 
-# ----------------------------------------------------------------------------
-# Pricing engine — worst-of put, fully per-asset Heston, full-truncation Euler
-# ----------------------------------------------------------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_div_yield(ticker: str) -> float:
+    """Dividend yield as a decimal; defensive against yfinance format changes."""
+    import yfinance as yf
+    try:
+        dy = yf.Ticker(ticker).info.get("dividendYield") or 0.0
+        dy = float(dy)
+        if dy > 0.25:          # sometimes returned in percent (e.g. 1.3 meaning 1.3%)
+            dy = dy / 100.0
+        return float(np.clip(dy, 0.0, 0.10))
+    except Exception:
+        return 0.0
 
-def price_wo_put(
-    v0s, thetas, kappas, xis, rho_svs, corr_assets, K_pct, T, r, q,
-    n_paths=50000, n_steps=252, antithetic=True, seed=42, n_sample_paths=40,
-):
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_riskfree_seed() -> float:
+    """Seed the risk-free rate from the 13-week T-bill index; fallback 4%."""
+    import yfinance as yf
+    try:
+        h = yf.Ticker("^IRX").history(period="5d")["Close"].dropna()
+        r = float(h.iloc[-1]) / 100.0
+        if 0.0 < r < 0.15:
+            return r
+    except Exception:
+        pass
+    return 0.04
+
+
+def _smile_from_chain(chain, spot):
+    """One expiry's smile: OTM options only, junk filtered. -> (moneyness, iv) sorted."""
+    puts, calls = chain.puts, chain.calls
+    rows = []
+    for df, side in ((puts, "put"), (calls, "call")):
+        if df is None or len(df) == 0:
+            continue
+        d = df.copy()
+        d = d[(d["bid"] > 0) & (d["ask"] > 0) & d["impliedVolatility"].between(0.01, 4.0)]
+        d["m"] = d["strike"] / spot
+        d = d[(d["m"] > 0.35) & (d["m"] < 1.8)]
+        # OTM side only: puts below spot, calls above (cleaner IVs)
+        d = d[d["m"] <= 1.0] if side == "put" else d[d["m"] > 1.0]
+        rows.append(d[["m", "impliedVolatility"]])
+    if not rows:
+        return None
+    sm = pd.concat(rows).sort_values("m")
+    sm = sm.groupby("m", as_index=False)["impliedVolatility"].mean()
+    return sm if len(sm) >= 4 else None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_iv(ticker: str, spot: float, target_T: float):
     """
-    Worst-of put, performance based:
-        WO(T) = min_i S_i(T) / S_i(0)
-        payoff = max(K_pct - WO(T), 0)   (fraction of notional)
+    Implied vol at ATM and at any moneyness, interpolated to target_T.
 
-    ALL Heston parameters are per-asset arrays:
-        v0s, thetas, kappas, xis, rho_svs — one entry per stock.
+    Picks the two listed expiries bracketing the target maturity, builds an
+    OTM smile for each, then interpolates linearly in TOTAL VARIANCE across
+    time. Returns a dict with iv(m) callable data, diagnostics, and the
+    short-dated ATM vol (used to seed Heston v0).
     """
-    rng = np.random.default_rng(seed)
-    v0s = np.asarray(v0s, dtype=float)
-    thetas = np.asarray(thetas, dtype=float)
-    kappas = np.asarray(kappas, dtype=float)
-    xis = np.asarray(xis, dtype=float)
-    rho_svs = np.asarray(rho_svs, dtype=float)
-    n_assets = len(v0s)
+    import yfinance as yf
+    tk = yf.Ticker(ticker)
+    expiries = tk.options
+    if not expiries:
+        raise ValueError(f"{ticker}: no listed options")
 
-    dt_ = T / n_steps
-    sqrt_dt = np.sqrt(dt_)
-    C = np.array([[1.0, corr_assets], [corr_assets, 1.0]]) if n_assets == 2 else np.eye(n_assets)
-    L = np.linalg.cholesky(C)
+    today = dt.date.today()
+    Ts = np.array([max(( dt.date.fromisoformat(e) - today).days, 1) / 365.0 for e in expiries])
+    order = np.argsort(Ts)
+    Ts, expiries = Ts[order], [expiries[i] for i in order]
 
-    n_base = n_paths // 2 if antithetic else n_paths
-    total = n_base * 2 if antithetic else n_base
+    # bracketing expiries (clamp to ends if target is outside listed range)
+    hi_idx = int(np.searchsorted(Ts, target_T))
+    lo_idx = max(hi_idx - 1, 0)
+    hi_idx = min(hi_idx, len(Ts) - 1)
+    extrapolated = target_T > Ts[-1] + 1e-9 or target_T < Ts[0] - 1e-9
 
-    X = np.ones((total, n_assets))          # performance space: X(0) = 1
-    v = np.tile(v0s, (total, 1))
+    smiles, used = {}, []
+    for idx in {lo_idx, hi_idx}:
+        sm = _smile_from_chain(tk.option_chain(expiries[idx]), spot)
+        if sm is not None:
+            smiles[idx] = sm
+            used.append((expiries[idx], float(Ts[idx]), len(sm)))
+    if not smiles:
+        raise ValueError(f"{ticker}: option chains too thin to build a smile")
 
-    n_show = min(n_sample_paths, total)
-    wo_paths = np.empty((n_show, n_steps + 1))
-    wo_paths[:, 0] = 1.0
+    def iv_at(idx, m):
+        sm = smiles[idx]
+        return float(np.interp(m, sm["m"].to_numpy(), sm["impliedVolatility"].to_numpy()))
 
-    orth = np.sqrt(1.0 - rho_svs**2)        # per-asset, broadcasts over paths
+    def iv(m):
+        """IV at moneyness m for target_T via total-variance interpolation."""
+        ids = sorted(smiles)
+        if len(ids) == 1:
+            return iv_at(ids[0], m)
+        i0, i1 = ids
+        T0, T1 = Ts[i0], Ts[i1]
+        w = float(np.clip((target_T - T0) / (T1 - T0), 0.0, 1.0)) if T1 > T0 else 1.0
+        tv = (1 - w) * iv_at(i0, m) ** 2 * T0 + w * iv_at(i1, m) ** 2 * T1
+        T_eff = (1 - w) * T0 + w * T1
+        return float(np.sqrt(max(tv, 1e-8) / max(T_eff, 1e-8)))
 
-    for step in range(n_steps):
-        Z1 = rng.standard_normal((n_base, n_assets))
-        Z2 = rng.standard_normal((n_base, n_assets))
-        if antithetic:
-            Z1 = np.vstack([Z1, -Z1])
-            Z2 = np.vstack([Z2, -Z2])
-
-        eps_S = Z1 @ L.T
-        eps_v = rho_svs * eps_S + orth * Z2   # per-asset spot–vol correlation
-
-        v_pos = np.maximum(v, 0.0)
-        X *= np.exp((r - q - 0.5 * v_pos) * dt_ + np.sqrt(v_pos) * sqrt_dt * eps_S)
-        v += kappas * (thetas - v_pos) * dt_ + xis * np.sqrt(v_pos) * sqrt_dt * eps_v
-
-        wo_paths[:, step + 1] = X[:n_show].min(axis=1)
-
-    wo_T = X.min(axis=1)
-    disc = np.exp(-r * T)
-
-    def mc_stats(payoffs):
-        if antithetic:
-            paired = 0.5 * (payoffs[:n_base] + payoffs[n_base:])
-            return disc * paired.mean(), disc * paired.std(ddof=1) / np.sqrt(n_base)
-        return disc * payoffs.mean(), disc * payoffs.std(ddof=1) / np.sqrt(n_base)
-
-    wo_price, wo_se = mc_stats(np.maximum(K_pct - wo_T, 0.0))
-    vanilla = [mc_stats(np.maximum(K_pct - X[:, i], 0.0)) for i in range(n_assets)]
-
+    # short-dated ATM vol for Heston v0 seed: nearest expiry >= ~2 weeks with a smile
+    v0_seed = None
+    for idx in range(len(Ts)):
+        if Ts[idx] >= 10 / 365:
+            sm = _smile_from_chain(tk.option_chain(expiries[idx]), spot)
+            if sm is not None:
+                v0_seed = float(np.interp(1.0, sm["m"].to_numpy(), sm["impliedVolatility"].to_numpy()))
+                break
+    # pack smile points of the longer bracketing expiry for plotting
+    plot_idx = max(smiles)
+    plot_sm = smiles[plot_idx]
     return {
-        "price": wo_price, "se": wo_se,
-        "ci": (wo_price - 1.96 * wo_se, wo_price + 1.96 * wo_se),
-        "vanilla": vanilla,
-        "wo_T": wo_T, "wo_paths": wo_paths,
-        "prob_exercise": float((wo_T < K_pct).mean()),
+        "iv_curve_m": plot_sm["m"].tolist(),
+        "iv_curve_v": plot_sm["impliedVolatility"].tolist(),
+        "plot_expiry": expiries[plot_idx],
+        "iv_atm": iv(1.0),
+        "iv_fn_points": {int(k): (smiles[k]["m"].tolist(), smiles[k]["impliedVolatility"].tolist(),
+                                  float(Ts[k])) for k in smiles},
+        "target_T": target_T,
+        "used": used,
+        "extrapolated": bool(extrapolated),
+        "v0_seed": v0_seed,
     }
 
 
-# ----------------------------------------------------------------------------
-# Sidebar — trade terms & simulation settings
-# ----------------------------------------------------------------------------
+def iv_from_pack(pack, m):
+    """Re-evaluate the total-variance interpolation from cached smile points."""
+    pts = pack["iv_fn_points"]
+    ids = sorted(pts)
+    def one(k):
+        ms, vs, _ = pts[k]
+        return float(np.interp(m, ms, vs))
+    if len(ids) == 1:
+        return one(ids[0])
+    (k0, k1) = ids
+    T0, T1 = pts[k0][2], pts[k1][2]
+    tT = pack["target_T"]
+    w = float(np.clip((tT - T0) / (T1 - T0), 0.0, 1.0)) if T1 > T0 else 1.0
+    tv = (1 - w) * one(k0) ** 2 * T0 + w * one(k1) ** 2 * T1
+    T_eff = (1 - w) * T0 + w * T1
+    return float(np.sqrt(max(tv, 1e-8) / max(T_eff, 1e-8)))
+
+
+# ============================================================================
+# PRICING ENGINES
+# ============================================================================
+
+def price_wo_implied(sig1, sig2, corr, K_pct, T, r, q1, q2,
+                     n_paths=500000, seed=42, antithetic=True):
+    """
+    Headline engine. Terminal-only correlated lognormal draw — EXACT for this
+    European payoff (no path dependence → no discretisation error), using each
+    stock's implied vol AT THE TRADE'S STRIKE AND TENOR (skew-consistent).
+    """
+    rng = np.random.default_rng(seed)
+    n_base = n_paths // 2 if antithetic else n_paths
+    Z = rng.standard_normal((n_base, 2))
+    if antithetic:
+        Z = np.vstack([Z, -Z])
+    e1 = Z[:, 0]
+    e2 = corr * Z[:, 0] + np.sqrt(1 - corr**2) * Z[:, 1]
+
+    X1 = np.exp((r - q1 - 0.5 * sig1**2) * T + sig1 * np.sqrt(T) * e1)
+    X2 = np.exp((r - q2 - 0.5 * sig2**2) * T + sig2 * np.sqrt(T) * e2)
+    wo = np.minimum(X1, X2)
+    disc = np.exp(-r * T)
+
+    def stats(pay):
+        if antithetic:
+            paired = 0.5 * (pay[:n_base] + pay[n_base:])
+            return disc * paired.mean(), disc * paired.std(ddof=1) / np.sqrt(n_base)
+        return disc * pay.mean(), disc * pay.std(ddof=1) / np.sqrt(n_base)
+
+    price, se = stats(np.maximum(K_pct - wo, 0.0))
+    v1 = stats(np.maximum(K_pct - X1, 0.0))
+    v2 = stats(np.maximum(K_pct - X2, 0.0))
+    return {"price": price, "se": se, "ci": (price - 1.96 * se, price + 1.96 * se),
+            "vanilla": [v1, v2], "wo_T": wo,
+            "prob_exercise": float((wo < K_pct).mean())}
+
+
+def price_wo_heston(v0s, thetas, kappas, xis, rho_svs, corr_assets, K_pct, T, r, qs,
+                    n_paths=50000, n_steps=252, antithetic=True, seed=42):
+    """Per-asset Heston, full-truncation Euler (comparison engine)."""
+    rng = np.random.default_rng(seed)
+    v0s, thetas = np.asarray(v0s, float), np.asarray(thetas, float)
+    kappas, xis, rho_svs = np.asarray(kappas, float), np.asarray(xis, float), np.asarray(rho_svs, float)
+    qs = np.asarray(qs, float)
+    n_assets = len(v0s)
+    dt_ = T / n_steps
+    sqrt_dt = np.sqrt(dt_)
+    C = np.array([[1.0, corr_assets], [corr_assets, 1.0]])
+    L = np.linalg.cholesky(C)
+    n_base = n_paths // 2 if antithetic else n_paths
+    total = n_base * 2 if antithetic else n_base
+    X = np.ones((total, n_assets))
+    v = np.tile(v0s, (total, 1))
+    orth = np.sqrt(1.0 - rho_svs**2)
+    for _ in range(n_steps):
+        Z1 = rng.standard_normal((n_base, n_assets))
+        Z2 = rng.standard_normal((n_base, n_assets))
+        if antithetic:
+            Z1, Z2 = np.vstack([Z1, -Z1]), np.vstack([Z2, -Z2])
+        eps_S = Z1 @ L.T
+        eps_v = rho_svs * eps_S + orth * Z2
+        v_pos = np.maximum(v, 0.0)
+        X *= np.exp((r - qs - 0.5 * v_pos) * dt_ + np.sqrt(v_pos) * sqrt_dt * eps_S)
+        v += kappas * (thetas - v_pos) * dt_ + xis * np.sqrt(v_pos) * sqrt_dt * eps_v
+    wo = X.min(axis=1)
+    disc = np.exp(-r * T)
+    pay = np.maximum(K_pct - wo, 0.0)
+    if antithetic:
+        paired = 0.5 * (pay[:n_base] + pay[n_base:])
+        price, se = disc * paired.mean(), disc * paired.std(ddof=1) / np.sqrt(n_base)
+    else:
+        price, se = disc * pay.mean(), disc * pay.std(ddof=1) / np.sqrt(n_base)
+    return {"price": price, "se": se}
+
+
+# ============================================================================
+# SIDEBAR — trade terms
+# ============================================================================
 
 st.sidebar.header("Underlyings")
 c1, c2 = st.sidebar.columns(2)
@@ -151,247 +277,222 @@ if t1 == t2:
     st.sidebar.error("Pick two different stocks.")
     st.stop()
 
-use_live = st.sidebar.toggle("Use live market data", value=True)
-
-md_ok, px_hist, md_meta = False, None, None
-if use_live:
-    try:
-        with st.spinner(f"Fetching {t1} / {t2} data..."):
-            spots_d, vol30_d, vollr_d, corr_mkt, px_hist, md_meta = fetch_market_data((t1, t2))
-        md_ok = True
-        d1, d2 = md_meta["days_used"][t1], md_meta["days_used"][t2]
-        st.sidebar.caption(f"History used: {t1} {d1}d · {t2} {d2}d · overlap {md_meta['overlap_days']}d")
-        if not md_meta["corr_estimated"]:
-            st.sidebar.warning("Too little overlapping history to estimate correlation — "
-                               "defaulting to 0.50. Set it yourself with the slider.")
-        elif min(d1, d2) < 60:
-            st.sidebar.info("One ticker has a short history (recent IPO) — vol and "
-                            "correlation estimates are noisy. Sanity-check the tables.")
-    except Exception as e:
-        st.sidebar.warning(f"Market data fetch failed ({e}). Enter values manually.")
-
-if md_ok:
-    S1_def, S2_def = float(spots_d[t1]), float(spots_d[t2])
-    v30_1, v30_2 = float(vol30_d[t1]), float(vol30_d[t2])
-    vlr_1, vlr_2 = float(vollr_d[t1]), float(vollr_d[t2])
-    corr_def = float(np.clip(corr_mkt, -0.95, 0.99))
-else:
-    S1_def, S2_def = 250.0, 100.0
-    v30_1 = v30_2 = 0.45
-    vlr_1 = vlr_2 = 0.50
-    corr_def = 0.50
-
 st.sidebar.header("Trade")
 today = dt.date.today()
-maturity = st.sidebar.date_input(
-    "Maturity date", value=today + dt.timedelta(days=365),
-    min_value=today + dt.timedelta(days=7), max_value=today + dt.timedelta(days=365 * 5),
-)
+maturity = st.sidebar.date_input("Maturity date", value=today + dt.timedelta(days=365),
+                                 min_value=today + dt.timedelta(days=7),
+                                 max_value=today + dt.timedelta(days=365 * 5))
 T = max((maturity - today).days, 1) / 365.0
 st.sidebar.caption(f"T = {T:.3f} years ({(maturity - today).days} days)")
-
 K_pct = st.sidebar.slider("Strike (% of spot)", 10, 150, 70, 1) / 100.0
 notional = st.sidebar.number_input("Notional (USD)", value=1_000_000, step=100_000)
-r = st.sidebar.slider("Risk-free rate (%)", 0.0, 10.0, 4.0, 0.05) / 100.0
-q = st.sidebar.slider("Dividend yield (%)", 0.0, 8.0, 0.0, 0.05) / 100.0
 
-st.sidebar.header("Spots & correlation")
-S1 = st.sidebar.number_input(f"{t1} spot", value=round(S1_def, 2), step=1.0)
-S2 = st.sidebar.number_input(f"{t2} spot", value=round(S2_def, 2), step=1.0)
-corr_assets = st.sidebar.slider("Asset correlation", -0.95, 0.99, round(corr_def, 2), 0.01,
-                                help="Defaults to realized correlation over the overlapping history")
+r_seed = fetch_riskfree_seed()
+r = st.sidebar.slider("Risk-free rate (%)", 0.0, 10.0, round(r_seed * 100, 2), 0.05,
+                      help="Seeded from the 13-week T-bill (^IRX)") / 100.0
 
 st.sidebar.header("Monte Carlo")
-n_paths = st.sidebar.select_slider("Paths", options=[10000, 25000, 50000, 100000, 200000], value=50000)
-n_steps = st.sidebar.select_slider("Time steps", options=[52, 126, 252, 504], value=252)
+n_paths = st.sidebar.select_slider("Paths", options=[100000, 250000, 500000, 1000000], value=500000)
 antithetic = st.sidebar.checkbox("Antithetic variates", value=True)
 seed = st.sidebar.number_input("Seed", value=42, step=1)
 
-# ----------------------------------------------------------------------------
-# Main — per-stock Heston tables
-# ----------------------------------------------------------------------------
+# ============================================================================
+# MAIN
+# ============================================================================
 
-st.title("📉 Worst-of Put Pricer")
+st.title("📉 Worst-of Put Pricer — market implied")
 st.caption(
-    f"Client **sells** a worst-of put on {t1} / {t2} — strike {K_pct:.0%} of spot, "
-    f"maturing {maturity:%d %b %Y}. Payoff to the buyer: "
-    "max(K% − min(S₁ₜ/S₁₀, S₂ₜ/S₂₀), 0) × notional. Each stock has its own full "
-    "Heston parameter set below."
+    f"Client **sells** a worst-of put on {t1} / {t2}, strike {K_pct:.0%}, maturing "
+    f"{maturity:%d %b %Y}. Headline price uses each stock's **implied vol read from its "
+    "live option chain at this strike and tenor** — skew included."
 )
 
-mc1, mc2, mc3, mc4 = st.columns(4)
-mc1.metric(f"{t1} spot", f"${S1:,.2f}")
-mc2.metric(f"{t2} spot", f"${S2:,.2f}")
-mc3.metric("Correlation", f"{corr_assets:.2f}")
-mc4.metric("Strike levels", f"${S1 * K_pct:,.2f} / ${S2 * K_pct:,.2f}")
+# ---- fetch everything -------------------------------------------------------
+fetch_errors = []
+try:
+    spots_d, vollr_d, corr_real, px_hist, hmeta = fetch_hist((t1, t2))
+    S1, S2 = float(spots_d[t1]), float(spots_d[t2])
+except Exception as e:
+    st.error(f"Could not fetch price history ({e}). Check tickers / connection.")
+    st.stop()
 
+q1, q2 = fetch_div_yield(t1), fetch_div_yield(t2)
 
-def heston_table(ticker: str, vol0_def: float, vollr_def: float, key: str) -> np.ndarray:
-    """Editable 5-row table of Heston parameters for one stock."""
-    df = pd.DataFrame({
-        "Parameter": PARAM_LABELS,
-        "Value": [round(vol0_def * 100, 1), round(vollr_def * 100, 1), 2.0, 0.60, -0.70],
-    })
-    edited = st.data_editor(
-        df, hide_index=True, use_container_width=True, key=key,
-        column_config={
-            "Parameter": st.column_config.TextColumn(disabled=True),
-            "Value": st.column_config.NumberColumn(format="%.2f"),
-        },
-    )
-    return edited["Value"].to_numpy(dtype=float)
+iv_packs, iv_strike, iv_source = {}, {}, {}
+for tkr, spot in ((t1, S1), (t2, S2)):
+    try:
+        pack = fetch_iv(tkr, spot, T)
+        iv_packs[tkr] = pack
+        iv_strike[tkr] = iv_from_pack(pack, K_pct)
+        iv_source[tkr] = "implied"
+    except Exception as e:
+        iv_strike[tkr] = vollr_d[tkr]
+        iv_source[tkr] = "realized (fallback)"
+        fetch_errors.append(f"{tkr}: {e} — using realized vol {vollr_d[tkr]:.1%} instead.")
 
+for msg in fetch_errors:
+    st.warning(msg)
 
-st.subheader("Heston parameters — one full set per stock")
-col_left, col_right = st.columns(2)
-with col_left:
-    st.markdown(f"**{t1}**")
-    p1 = heston_table(t1, v30_1, vlr_1, key=f"heston_{t1}")
-with col_right:
-    st.markdown(f"**{t2}**")
-    p2 = heston_table(t2, v30_2, vlr_2, key=f"heston_{t2}")
-st.caption("Vols in % (seeded from 30d and full-history realized vol). "
-           "κ = mean reversion speed, ξ = vol of vol, ρ = spot–vol correlation (clipped to ±0.99).")
+# ---- data summary -----------------------------------------------------------
+mcols = st.columns(4)
+mcols[0].metric(f"{t1} spot", f"${S1:,.2f}")
+mcols[1].metric(f"{t2} spot", f"${S2:,.2f}")
+mcols[2].metric(f"{t1} IV @ {K_pct:.0%}K, {T:.2f}y", f"{iv_strike[t1]:.1%}",
+                help=f"Source: {iv_source[t1]}")
+mcols[3].metric(f"{t2} IV @ {K_pct:.0%}K, {T:.2f}y", f"{iv_strike[t2]:.1%}",
+                help=f"Source: {iv_source[t2]}")
 
+for tkr in (t1, t2):
+    if tkr in iv_packs:
+        used = ", ".join(f"{e} ({n} pts)" for e, _, n in iv_packs[tkr]["used"])
+        extra = " ⚠️ target tenor outside listed expiries — flat extrapolation" \
+            if iv_packs[tkr]["extrapolated"] else ""
+        st.caption(f"{tkr}: smile built from expiries {used}{extra}")
 
-def parse_params(p, ticker):
-    """Table rows -> (v0, theta, kappa, xi, rho) with validation."""
-    vol0, vollr, kappa, xi, rho = p
-    problems = []
-    if not (1 <= vol0 <= 300):
-        problems.append("initial vol should be 1–300%")
-    if not (1 <= vollr <= 300):
-        problems.append("long-run vol should be 1–300%")
-    if kappa <= 0:
-        problems.append("κ must be > 0")
-    if xi < 0:
-        problems.append("ξ must be ≥ 0")
-    rho = float(np.clip(rho, -0.99, 0.99))
-    if problems:
-        st.error(f"{ticker}: " + "; ".join(problems))
-        st.stop()
-    return (vol0 / 100) ** 2, (vollr / 100) ** 2, float(kappa), float(xi), rho
+with st.expander("Implied vol smiles (as fetched)"):
+    figs = go.Figure()
+    for tkr in (t1, t2):
+        if tkr in iv_packs:
+            p = iv_packs[tkr]
+            figs.add_trace(go.Scatter(x=np.array(p["iv_curve_m"]) * 100,
+                                      y=np.array(p["iv_curve_v"]) * 100,
+                                      mode="lines+markers", name=f"{tkr} ({p['plot_expiry']})"))
+    figs.add_vline(x=K_pct * 100, line_dash="dash", line_color="#E45756",
+                   annotation_text=f"Strike {K_pct:.0%}")
+    figs.add_vline(x=100, line_dash="dot", line_color="#54A24B", annotation_text="ATM")
+    figs.update_layout(xaxis_title="Moneyness (% of spot)", yaxis_title="Implied vol (%)",
+                       height=380, legend=dict(orientation="h"))
+    st.plotly_chart(figs, use_container_width=True)
+    st.caption("OTM options only, zero-bid strikes filtered out. The pricer reads the vol "
+               "exactly at the strike line, interpolated to your maturity in total variance.")
 
-
-v0_1, th_1, ka_1, xi_1, rh_1 = parse_params(p1, t1)
-v0_2, th_2, ka_2, xi_2, rh_2 = parse_params(p2, t2)
-
-# Feller check per stock
-for tkr, ka, th, xi_ in [(t1, ka_1, th_1, xi_1), (t2, ka_2, th_2, xi_2)]:
-    if 2 * ka * th <= xi_**2:
-        st.info(f"{tkr}: Feller condition violated (2κθ ≤ ξ²) — variance can touch zero. "
-                "Full truncation handles it; consider more time steps.")
-
-if px_hist is not None:
-    with st.expander("Underlying price history"):
-        norm_px = px_hist.apply(lambda s: s / s.loc[s.first_valid_index()] * 100)
-        figp = go.Figure()
-        for col in norm_px.columns:
-            figp.add_trace(go.Scatter(x=norm_px.index, y=norm_px[col], name=col, mode="lines"))
-        figp.update_layout(yaxis_title="Rebased to 100", height=320, legend=dict(orientation="h"))
-        st.plotly_chart(figp, use_container_width=True)
+# ---- pricing inputs (editable, seeded from the surface) ----------------------
+st.subheader("Pricing inputs")
+ic1, ic2, ic3 = st.columns(3)
+sig1 = ic1.number_input(f"{t1} vol used (%)", value=round(iv_strike[t1] * 100, 1),
+                        min_value=1.0, max_value=300.0, step=0.5) / 100.0
+sig2 = ic2.number_input(f"{t2} vol used (%)", value=round(iv_strike[t2] * 100, 1),
+                        min_value=1.0, max_value=300.0, step=0.5) / 100.0
+corr_used = ic3.slider("Correlation used", -0.95, 0.99,
+                       round(float(np.clip(corr_real, -0.95, 0.99)), 2), 0.01)
+st.caption(
+    f"Vols seeded from the option surface at the {K_pct:.0%} strike; edit freely. "
+    f"Correlation seeded from realized ({corr_real:.2f} over {hmeta['overlap']}d overlap). "
+    "Desks typically mark **implied** correlation 5–15 points above realized for worst-of "
+    "pricing — nudging the slider up gives a more market-conservative (lower) premium."
+)
 
 if st.button("Price it", type="primary"):
-    with st.spinner("Simulating..."):
-        res = price_wo_put(
-            [v0_1, v0_2], [th_1, th_2], [ka_1, ka_2], [xi_1, xi_2], [rh_1, rh_2],
-            corr_assets, K_pct, T, r, q,
-            n_paths=int(n_paths), n_steps=int(n_steps),
-            antithetic=antithetic, seed=int(seed),
-        )
+    res = price_wo_implied(sig1, sig2, corr_used, K_pct, T, r, q1, q2,
+                           n_paths=int(n_paths), seed=int(seed), antithetic=antithetic)
+    premium_pct, premium_usd = res["price"], res["price"] * notional
 
-    premium_pct = res["price"]
-    premium_usd = premium_pct * notional
+    pc = st.columns(4)
+    pc[0].metric("Fair premium (client receives)", f"{premium_pct:.2%} of notional")
+    pc[1].metric("Premium (USD)", f"${premium_usd:,.0f}")
+    pc[2].metric("95% CI", f"[{res['ci'][0]:.2%}, {res['ci'][1]:.2%}]")
+    pc[3].metric("P(exercised at T)", f"{res['prob_exercise']:.1%}",
+                 help="Risk-neutral probability the worst performer finishes below strike")
+    st.caption("This is **fair value**. A client-facing quote embeds dealer margin — "
+               "typically 0.5–3% of notional lower — so expect real term sheets to sit "
+               "slightly below this number.")
 
-    p1c, p2c, p3c, p4c = st.columns(4)
-    p1c.metric("Premium (client receives)", f"{premium_pct:.2%} of notional")
-    p2c.metric("Premium (USD)", f"${premium_usd:,.0f}")
-    p3c.metric("95% CI", f"[{res['ci'][0]:.2%}, {res['ci'][1]:.2%}]")
-    p4c.metric("P(exercised at T)", f"{res['prob_exercise']:.1%}",
-               help="Probability the worst performer finishes below the strike (risk-neutral)")
+    st.subheader("Worst-of vs vanilla puts")
+    (v1p, _), (v2p, _) = res["vanilla"]
+    cc = st.columns(3)
+    cc[0].metric(f"Vanilla {K_pct:.0%} put on {t1}", f"{v1p:.2%}")
+    cc[1].metric(f"Vanilla {K_pct:.0%} put on {t2}", f"{v2p:.2%}")
+    cc[2].metric("Worst-of pickup", f"+{premium_pct - max(v1p, v2p):.2%}",
+                 help="Extra premium vs the richer single-name put — the dispersion premium")
 
-    st.subheader("Worst-of vs vanilla puts — the correlation trade")
-    v1_price, _ = res["vanilla"][0]
-    v2_price, _ = res["vanilla"][1]
-    cA, cB, cC = st.columns(3)
-    cA.metric(f"Vanilla {K_pct:.0%} put on {t1}", f"{v1_price:.2%}")
-    cB.metric(f"Vanilla {K_pct:.0%} put on {t2}", f"{v2_price:.2%}")
-    cC.metric("Worst-of premium pickup", f"+{premium_pct - max(v1_price, v2_price):.2%}",
-              help="Extra premium vs the richer single-name put")
-    st.caption(
-        "The worst-of put always costs more than either vanilla — the buyer gets paid on "
-        "whichever name does worse. The pickup shrinks as correlation → 1 and grows as it "
-        "falls: the client selling this is **long correlation**."
-    )
+    tabs = st.tabs(["Worst-of distribution", "Payoff at maturity (client view)", "Heston comparison"])
 
-    tab1, tab2, tab3 = st.tabs(["Worst-of distribution", "Payoff at maturity (client view)", "Sample paths"])
-
-    with tab1:
+    with tabs[0]:
         fig = go.Figure()
-        fig.add_trace(go.Histogram(x=res["wo_T"] * 100, nbinsx=80,
+        fig.add_trace(go.Histogram(x=res["wo_T"][:200000] * 100, nbinsx=90,
                                    marker_color="#4C78A8", opacity=0.85))
         fig.add_vline(x=K_pct * 100, line_dash="dash", line_color="#E45756",
                       annotation_text=f"Strike {K_pct:.0%}")
         fig.add_vline(x=100, line_dash="dot", line_color="#54A24B", annotation_text="Spot")
-        fig.update_layout(title=f"Worst-of performance at maturity — {res['prob_exercise']:.1%} of paths below strike",
-                          xaxis_title="min(S₁ₜ/S₁₀, S₂ₜ/S₂₀)  (% of spot)",
-                          yaxis_title="Paths", showlegend=False, height=420)
+        fig.update_layout(title=f"Worst-of performance at maturity — {res['prob_exercise']:.1%} below strike",
+                          xaxis_title="min(S₁ₜ/S₁₀, S₂ₜ/S₂₀) (% of spot)", yaxis_title="Paths",
+                          showlegend=False, height=420)
         st.plotly_chart(fig, use_container_width=True)
 
-    with tab2:
+    with tabs[1]:
         wo_grid = np.linspace(0.0, 1.5, 301)
-        client_pnl = premium_pct - np.maximum(K_pct - wo_grid, 0.0)
+        pnl = premium_pct - np.maximum(K_pct - wo_grid, 0.0)
+        breakeven = (K_pct - premium_pct) * 100
         fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=wo_grid * 100, y=client_pnl * 100, mode="lines",
-                                  line=dict(color="#4C78A8", width=2), name="Client P&L"))
+        fig2.add_trace(go.Scatter(x=wo_grid * 100, y=pnl * 100, mode="lines",
+                                  line=dict(color="#4C78A8", width=2)))
         fig2.add_hline(y=0, line_color="grey", line_width=1)
         fig2.add_vline(x=K_pct * 100, line_dash="dash", line_color="#E45756",
                        annotation_text=f"Strike {K_pct:.0%}")
-        breakeven = (K_pct - premium_pct) * 100
         fig2.add_vline(x=breakeven, line_dash="dot", line_color="#F58518",
                        annotation_text=f"Breakeven {breakeven:.1f}%")
         fig2.update_layout(title="Client P&L at maturity (short worst-of put, % of notional)",
-                           xaxis_title="Worst-of performance at T (% of spot)",
+                           xaxis_title="Worst-of performance at T (%)",
                            yaxis_title="P&L (% of notional)", height=420)
         st.plotly_chart(fig2, use_container_width=True)
-        st.caption(
-            f"Max gain = premium ({premium_pct:.2%}). Below the {breakeven:.1f}% breakeven the "
-            f"client loses; worst case the loss approaches {K_pct - premium_pct:.1%} of notional."
-        )
 
-    with tab3:
-        fig3 = go.Figure()
-        t_grid = np.linspace(0, T, res["wo_paths"].shape[1])
-        for path in res["wo_paths"]:
-            fig3.add_trace(go.Scatter(x=t_grid, y=path * 100, mode="lines",
-                                      line=dict(width=1), opacity=0.5, showlegend=False))
-        fig3.add_hline(y=K_pct * 100, line_dash="dash", line_color="#E45756",
-                       annotation_text=f"Strike {K_pct:.0%}")
-        fig3.update_layout(title=f"{res['wo_paths'].shape[0]} sample worst-of paths",
-                           xaxis_title="Time (years)", yaxis_title="Worst-of performance (%)",
-                           height=420)
-        st.plotly_chart(fig3, use_container_width=True)
+    with tabs[2]:
+        st.markdown("**Per-stock Heston (stochastic vol view)** — seeded from the implied "
+                    "surface: √v₀ from short-dated ATM IV, √θ from ATM IV at your tenor.")
+        hcols = st.columns(2)
+        tables = {}
+        for col, tkr in zip(hcols, (t1, t2)):
+            with col:
+                st.markdown(f"**{tkr}**")
+                if tkr in iv_packs:
+                    v0_seed = iv_packs[tkr]["v0_seed"] or iv_packs[tkr]["iv_atm"]
+                    th_seed = iv_packs[tkr]["iv_atm"]
+                else:
+                    v0_seed = th_seed = iv_strike[tkr]
+                df = pd.DataFrame({"Parameter": PARAM_LABELS,
+                                   "Value": [round(v0_seed * 100, 1), round(th_seed * 100, 1),
+                                             2.0, 0.9, -0.6]})
+                tables[tkr] = st.data_editor(
+                    df, hide_index=True, use_container_width=True, key=f"h_{tkr}",
+                    column_config={"Parameter": st.column_config.TextColumn(disabled=True),
+                                   "Value": st.column_config.NumberColumn(format="%.2f")})
+        pvals = {k: v["Value"].to_numpy(float) for k, v in tables.items()}
+        hres = price_wo_heston(
+            [(pvals[t1][0] / 100) ** 2, (pvals[t2][0] / 100) ** 2],
+            [(pvals[t1][1] / 100) ** 2, (pvals[t2][1] / 100) ** 2],
+            [pvals[t1][2], pvals[t2][2]], [pvals[t1][3], pvals[t2][3]],
+            [float(np.clip(pvals[t1][4], -0.99, 0.99)), float(np.clip(pvals[t2][4], -0.99, 0.99))],
+            corr_used, K_pct, T, r, [q1, q2],
+            n_paths=50000, n_steps=252, antithetic=True, seed=int(seed))
+        st.metric("Heston price", f"{hres['price']:.2%}",
+                  delta=f"{hres['price'] - premium_pct:+.2%} vs implied-vol price")
+        st.caption("Uncalibrated beyond the ATM seeds — treat as a sensitivity view, not the "
+                   "quote. The headline number already carries the market's skew because it "
+                   "reads IV at the actual strike.")
 else:
-    st.info("Edit the two Heston tables above and the trade terms in the sidebar, then hit **Price it**.")
+    st.info("Review the vols pulled from the option chains above, adjust if needed, then hit "
+            "**Price it**.")
 
-with st.expander("Model notes"):
+with st.expander("Why this matches the market (and earlier versions didn't)"):
     st.markdown(
         r"""
-**Payoff.** $\max\!\big(K\% - \min_i \tfrac{S_i(T)}{S_i(0)},\, 0\big) \times \text{notional}$,
-simulated in performance space so spots only matter for displaying dollar strikes.
+**Implied, not realized.** Market premiums are set by what options *cost now* — implied
+vol — not by trailing realized vol. For single names these can differ by 10–20 vol points,
+which at a 70% strike is enormous.
 
-**Dynamics.** Each stock follows its **own** Heston process — all five parameters
-($v_0$, $\theta$, $\kappa$, $\xi$, $\rho$) are per-stock, set in the tables:
+**Skew.** A 70% strike put lives on the steep part of the smile: its IV is well above ATM.
+This pricer reads the vol **at the trade's strike**, interpolating across listed strikes,
+and across the two bracketing expiries linearly in total variance $\sigma^2 T$.
 
-$$dS_i = (r - q)\,S_i\,dt + \sqrt{v_i}\,S_i\,dW_i^S \qquad
-dv_i = \kappa_i(\theta_i - v_i)\,dt + \xi_i\sqrt{v_i}\,dW_i^v$$
+**Exact simulation.** The payoff depends only on terminal values, so the headline engine
+draws terminal prices in one exact lognormal step — no discretisation error, and enough
+paths (500k default) to shrink the Monte Carlo interval to a few basis points.
 
-Stock–stock correlation applies to the price shocks via a Cholesky factor; each
-stock's variance shock is then $\rho_i\,\varepsilon_i^S + \sqrt{1-\rho_i^2}\,Z_i$.
-Discretisation is full-truncation Euler with antithetic variates.
-
-**Calibration.** Table defaults are seeded from realized data (30d vol → $\sqrt{v_0}$,
-full-history vol → $\sqrt{\theta}$); a desk would calibrate each stock's five
-parameters to its implied vol surface, and use implied rather than realized correlation.
+**What's still approximate.** (1) Using each name's strike-IV in a lognormal model is the
+standard structurer shortcut — a full local/stochastic-vol calibration would price the
+smile *dynamics* too, usually a small effect for a 1y European worst-of. (2) Correlation
+is seeded from realized; there is no listed implied-correlation market for stock pairs, so
+desks mark it up judgmentally — the slider is there for exactly that. (3) Fair value ≠
+client quote: term sheets embed distribution/hedging margin, typically 0.5–3% of notional.
 """
     )
